@@ -1,0 +1,8 @@
+{
+  "name": "pump-fun-sharpe-sprint",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pump.fun Sharpe Sprint — paper bot for agent-fun/replay/v2",
+  "license": "MIT"
+}
