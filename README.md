@@ -73,8 +73,9 @@ exits fire as designed.
 
 ## Local grade (house `grade-local`, dev window, `--driver process`)
 
-Final version, graded from the worktree (commit pending at grade
-time; the graded files are exactly the committed ones):
+Final version, graded from the worktree and then committed unchanged
+as `275b080` (the graded files are byte-identical to the commit; the
+repeat run below was on the same worktree):
 
 - **Net PnL: +34,866,343 lamports (+0.00349 SOL, +0.35%)**
 - **Hourly Sharpe: +0.0815** (Sortino 0.139)
