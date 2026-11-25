@@ -5,36 +5,60 @@
 // itself — up at least 25% from its launch price, still rising over its
 // last few trades, sitting on at least 20 SOL of real reserves, with crowd
 // buys clearly ahead of crowd sells — then exit on a wide take-profit, a
-// wide stop, a trailing give-back, or a time cap.
+// tight stop, a trailing give-back, or a time cap.
 //
 // Why this shape, and why not momentum-chasing: on the kit's 24-hour dev
 // window every loose entry rule loses money. Buying a coin after a small
-// +4% wiggle means buying the top of its first pump: the dev replay shows
-// stops hit ~3.5x as often as take-profits and a -3.3% return. A signal
-// study over the same data (first-hit +TP% / -SL% per entry bucket) shows
-// no entry condition wins more than ~49% of the time at tight targets,
-// while the one bucket with positive expected value is the strong runner:
-// deep real reserves, a big established gain, still rising. So this bot
-// trades rarely and only there. It accepts the cost — about 70 round trips
-// per 24 hours on the dev window, so a 6-hour final window is expected to
-// clear the 20-distinct-mint bar with some margin, and that bar risk is
-// real — rather than dilute the edge with losing filler trades.
+// +4% wiggle means buying the top of its first pump. A signal study over
+// the same data (first-hit +TP% / -SL% per entry bucket) shows no entry
+// condition wins more than ~49% of the time at tight targets, while the
+// one bucket with positive expected value is the strong runner: deep real
+// reserves, a big established gain, still rising. So this bot trades
+// rarely and only there. The binding trade-off is the 20-distinct-mint
+// bar: the bot makes ~71 round trips over the 24-hour dev window, so a
+// 6-hour final window is expected to yield ~18 — just under the bar on a
+// straight pro-rata, and looser entry rules that would clear it (more
+// trips, later entries) all lose money locally. That bar risk is real
+// and is the main open risk of this entry, not the PnL.
 //
-// Exits (first trigger wins): take-profit +25%, stop-loss -10%, trailing
+// Exits (first trigger wins): take-profit +25%, stop-loss -5%, trailing
 // exit after giving back 15% from the post-entry peak (only while in
 // profit), time cap after 14,400 slots held. A mint is traded at most once:
 // after a round trip it is never re-entered (re-entering winners and
 // entering late — past 50 trades — both tested worse on the dev window).
 //
+// Local backtester result for these exact parameters (a replay that
+// mirrors the house fill math; the house grade-local run is the ground
+// truth and is reported in the README): net +30,093,599 lamports
+// (+0.30%), hourly Sharpe +0.053, win rate 42.3%, 71 round trips / 71
+// distinct mints, max drawdown 0.83%. The two parameters that make it
+// net-positive are the tight -5% stop (stops still hit ~1.9x as often as
+// take-profits, but each costs ~-3.5M lamports instead of ~-5.8M) and
+// the wider 10% sell slippage (see below).
+//
+// BUG FIX (2026-11-26, continuation builder): the first version recorded
+// the buy's client_id from state.clientId() but sent the order WITHOUT
+// it, so the shim assigned a different fresh id on the wire and the fill
+// arrived under an id pendingBuys never saw. Entries were therefore never
+// recorded, TP / SL / trailing never fired, and every position was held
+// to the time cap — the house grade for that version was -341,304,869
+// lamports (-3.41%), Sharpe -0.551, 48 round trips, median hold 14,403
+// slots. The buy order now carries its client_id through, so fills
+// match and exits fire as designed.
+//
 // Fees: ~95 bps protocol + ~30 bps creator per side, plus 5,000 + 100,000
 // lamports of tx fees per order — roughly 3.5% of a 0.02 SOL stake per
-// round trip. The 25% take-profit clears that with room; the 10% stop
-// keeps the losing tail short. Two extra guards come from replaying the
-// dev data: crowds sometimes dump a curve back to ~2 lamports of real
-// reserves, so a sell whose expected proceeds do not cover its own tx fee
-// is skipped (the harness would write the tokens off instead), and a
-// rejected sell is retried at most once per 300 slots, so a dumped curve
-// cannot spam attempts (each attempt risks a 2% seeded failed tx).
+// round trip. The 25% take-profit clears that with room; the 5% stop
+// keeps the losing tail short. Sells tolerate 10% slippage while buys
+// tolerate 3%: on a fast dump a sell rejected at 3% is retried only after
+// a 300-slot cooldown, by which time the curve has usually rugged to the
+// floor, so the exit must fill near its trigger. Two extra guards come
+// from replaying the dev data: crowds sometimes dump a curve back to ~2
+// lamports of real reserves, so a sell whose expected proceeds do not
+// cover its own tx fee is skipped (the harness would write the tokens off
+// instead), and a rejected sell is retried at most once per 300 slots, so
+// a dumped curve cannot spam attempts (each attempt risks a 2% seeded
+// failed tx).
 //
 // Determinism: no clock, no environment, no Math.random. All state comes
 // from harness messages and every scan follows Map insertion order
@@ -59,8 +83,8 @@ import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 const BUY_LAMPORTS = 20_000_000n;
 /** Take profit: sell once the mark is +25% over the entry price. */
 const TAKE_PROFIT_BPS = 2500;
-/** Stop loss: sell once the mark is -10% under the entry price. */
-const STOP_LOSS_BPS = 1000;
+/** Stop loss: sell once the mark is -5% under the entry price. */
+const STOP_LOSS_BPS = 500;
 /** Trailing exit: sell after giving back 15% from the post-entry peak. */
 const TRAILING_BPS = 1500;
 /** Time exit: sell after this many slots held. */
@@ -81,8 +105,14 @@ const BUY_DOMINANCE_NUM = 5n;
 const BUY_DOMINANCE_DEN = 4n;
 /** Max new buys decided in one batch: staggers entries. */
 const MAX_BUYS_PER_BATCH = 2;
-/** Slippage tolerance on every order. */
-const MAX_SLIPPAGE_BPS = 300;
+/** Slippage tolerance on buys: a buy that would fill worse than this vs
+ *  the decision-time reserves is rejected, so we never chase a pump. */
+const MAX_BUY_SLIPPAGE_BPS = 300;
+/** Slippage tolerance on sells, wider on purpose: on a fast dump a sell
+ *  rejected at 3% is retried only after a 300-slot cooldown, by which
+ *  time the curve has usually rugged to the floor; 10% lets the exit
+ *  fill near its trigger instead. */
+const MAX_SELL_SLIPPAGE_BPS = 1000;
 /** Sell retry cooldown, in slots, after a rejected sell attempt. */
 const SELL_RETRY_COOLDOWN_SLOTS = 300;
 
@@ -238,7 +268,7 @@ await runBot({
       const lastTry = lastSellTry.get(mint);
       if (lastTry !== undefined && batch.slot - lastTry < SELL_RETRY_COOLDOWN_SLOTS) return;
       lastSellTry.set(mint, batch.slot);
-      orders.push({ side: 'sell', mint, token_amount: tokens, max_slippage_bps: MAX_SLIPPAGE_BPS });
+      orders.push({ side: 'sell', mint, token_amount: tokens, max_slippage_bps: MAX_SELL_SLIPPAGE_BPS });
     }
 
     // 3. Exits first: every held position is checked against TP / SL /
@@ -317,7 +347,12 @@ await runBot({
         if (state.freeCashLamports() < BUY_LAMPORTS + 2n * txFee) break;
         const clientId = state.clientId();
         pendingBuys.set(clientId, { mint, price, slot: batch.slot });
-        orders.push({ side: 'buy', mint, quote_lamports: BUY_LAMPORTS, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        // Pass the id through: the shim assigns a DIFFERENT fresh id when
+        // client_id is omitted, so the buy fill would arrive under an id
+        // pendingBuys never saw, the entry price would never be recorded,
+        // and TP / SL / trailing would never fire (positions would only
+        // exit on the time cap, after the curve had usually rugged).
+        orders.push({ side: 'buy', mint, quote_lamports: BUY_LAMPORTS, max_slippage_bps: MAX_BUY_SLIPPAGE_BPS, client_id: clientId });
         buys += 1;
       }
     }
